@@ -1,0 +1,12 @@
+# Terraform state holds database passwords and COS HMAC secrets
+*.tfstate
+*.tfstate.*
+*.bak
+crash.log
+
+# Variable files can hold the IBM Cloud API key, license and passwords
+*.tfvars
+*.tfvars.json
+!terraform.tfvars.example
+
+.terraform/

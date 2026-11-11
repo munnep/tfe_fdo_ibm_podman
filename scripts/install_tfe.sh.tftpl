@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Starts Terraform Enterprise as a Podman pod managed by systemd (Quadlet).
+exec > >(tee -a /var/log/tfe-bootstrap.log) 2>&1
+set -u
+echo "=== install_tfe $(date -u +%FT%TZ)"
+
+# Never start TFE against a database without its extensions
+if [ ! -f /var/lib/tfe-bootstrap/postgres.done ]; then
+  echo "ERROR: PostgreSQL extensions are not in place (see /var/log/tfe-postgres-init.log)"
+  exit 1
+fi
+
+# Vault (active/active) uses the private address of this node
+LOCAL_IP=$(ip route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1)}' | head -n1)
+if [ -z "$LOCAL_IP" ]; then
+  echo "ERROR: cannot determine the local IP address"
+  exit 1
+fi
+echo "local ip: $LOCAL_IP"
+sed -i "s/PRIVATE_IP_ADDRESS_WILL_BE_PLACED_HERE/$LOCAL_IP/g" /etc/containers/systemd/tfe.yaml
+
+# Trust bundle for TFE: server chain + the Redis service certificate
+{ cat /opt/tfe/certs/cert.pem; echo; cat /opt/tfe/certs/redis-ca.pem; } > /opt/tfe/certs/bundle.pem
+
+# Registry login and image pull, retried because the registry or the network can be slow right after boot
+. /etc/tfe/registry.env
+ok=0
+for i in $(seq 1 10); do
+  if echo "$REGISTRY_PASSWORD" | podman login --username "$REGISTRY_USERNAME" --password-stdin "${registry_host}" \
+     && podman pull "${image}"; then
+    ok=1
+    break
+  fi
+  echo "image pull failed, retry $i"
+  sleep 15
+done
+[ "$ok" = 1 ] || { echo "ERROR: cannot pull ${image}"; exit 1; }
+
+systemctl daemon-reload
+systemctl start terraform-enterprise.service
+echo "terraform-enterprise.service started"
+
+# Informational only: wait for this node to report ready
+for i in $(seq 1 60); do
+  if curl -ksS -o /dev/null -f --max-time 5 https://localhost/api/v1/health/readiness; then
+    echo "TFE reports healthy"
+    exit 0
+  fi
+  sleep 15
+done
+echo "TFE is not healthy yet after 15 minutes. Check: journalctl -u terraform-enterprise and podman logs"
+exit 0

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Creates the PostgreSQL extensions Terraform Enterprise needs. The database only has a private endpoint, so this
+# runs on the TFE nodes (replaces the Kubernetes Job of the old tfe_kubernetes stage).
+#
+# - Idempotent: a node that already did this exits immediately (marker file).
+# - Safe with several nodes at the same time: one psql session holds an advisory lock while it creates the extensions.
+# - Retries, because the VPE name resolution or the database can need a few minutes after the first apply.
+# - On success it writes /var/lib/tfe-bootstrap/postgres.done. install_tfe.sh refuses to start TFE without it.
+exec > >(tee -a /var/log/tfe-postgres-init.log) 2>&1
+set -u
+
+MARKER=/var/lib/tfe-bootstrap/postgres.done
+ATTEMPTS=${attempts}
+INTERVAL=${interval}
+EXPECTED=${extension_count}
+
+echo "=== init_postgres $(date -u +%FT%TZ)"
+mkdir -p /var/lib/tfe-bootstrap
+if [ -f "$MARKER" ]; then
+  echo "already done"
+  exit 0
+fi
+
+# Load the connection settings without printing them and without passing them as arguments
+while IFS='=' read -r k v; do
+  [ -n "$k" ] && export "$k=$v"
+done < /etc/tfe/postgres.env
+
+run_psql() {
+  if command -v psql > /dev/null 2>&1; then
+    psql -X "$@"
+  else
+    podman run --rm -i --network host --env-file /etc/tfe/postgres.env "${client_image}" psql -X "$@"
+  fi
+}
+
+for i in $(seq 1 "$ATTEMPTS"); do
+  echo "attempt $i of $ATTEMPTS"
+  if run_psql -v ON_ERROR_STOP=1 -q <<'SQL'
+SELECT pg_advisory_lock(727274);
+${extension_sql}
+SQL
+  then
+    FOUND=$(run_psql -tA -c "SELECT count(*) FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE n.nspname = '${extension_schema}' AND e.extname IN (${extension_list});" 2>/dev/null | tr -d '[:space:]')
+    if [ "$FOUND" = "$EXPECTED" ]; then
+      date -u +%FT%TZ > "$MARKER"
+      echo "extensions present: $FOUND of $EXPECTED"
+      exit 0
+    fi
+    echo "verification failed: found '$FOUND', expected $EXPECTED"
+  fi
+  sleep "$INTERVAL"
+done
+
+echo "ERROR: could not create the PostgreSQL extensions, TFE will not be started on this node"
+exit 1

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Prepares a RHEL node for Terraform Enterprise: kernel settings, swap, data disk and Podman.
+# Runs from cloud-init on every new node. Safe to run again.
+exec > >(tee -a /var/log/tfe-bootstrap.log) 2>&1
+set -u
+echo "=== install_software $(date -u +%FT%TZ)"
+
+# Wait for the network (the node reaches the internet through the public gateway of its zone)
+until curl -sS -o /dev/null --max-time 5 "https://${registry_host}"; do
+  echo "waiting for network / ${registry_host}"
+  sleep 5
+done
+
+# Tools the minimal RHEL image may not have (mkfs.xfs for the data volume)
+dnf install -y xfsprogs util-linux || { echo "ERROR: dnf install xfsprogs failed"; exit 1; }
+
+# Kernel settings
+for f in enabled defrag; do
+  [ -f /sys/kernel/mm/transparent_hugepage/$f ] && echo never > /sys/kernel/mm/transparent_hugepage/$f
+done
+cat > /etc/sysctl.d/99-tfe.conf <<'EOF'
+vm.swappiness=1
+vm.min_free_kbytes=67584
+EOF
+sysctl --system > /dev/null
+
+# Swap file on the boot volume
+if ! swapon --show=NAME --noheadings | grep -q /var/swapfile; then
+  if [ ! -f /var/swapfile ]; then
+    fallocate -l ${swap_gb}G /var/swapfile
+    chmod 600 /var/swapfile
+    mkswap /var/swapfile
+  fi
+  grep -q '^/var/swapfile' /etc/fstab || echo '/var/swapfile none swap defaults 0 0' >> /etc/fstab
+  swapon /var/swapfile
+fi
+
+# Data volume -> /var/lib/containers (container images, TFE cache and run data).
+# The disk is found by size and by not being mounted: the boot volume and the small cloud-init disk are excluded.
+mkdir -p /var/lib/containers
+if ! mountpoint -q /var/lib/containers; then
+  WANT=$(( ${data_gb} * 1024 * 1024 * 1024 ))
+  DISK=""
+  for name in $(lsblk -b -dn -o NAME,SIZE,TYPE | awk -v want="$WANT" '$3=="disk" && $2==want {print $1}'); do
+    if ! lsblk -n -o MOUNTPOINTS "/dev/$name" | grep -q .; then
+      DISK="/dev/$name"
+      break
+    fi
+  done
+  if [ -z "$DISK" ]; then
+    echo "ERROR: no unused ${data_gb} GB data disk found"
+    lsblk
+    exit 1
+  fi
+  blkid "$DISK" > /dev/null 2>&1 || mkfs.xfs "$DISK"
+  UUID=$(blkid -s UUID -o value "$DISK")
+  grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /var/lib/containers xfs defaults,nofail 0 0" >> /etc/fstab
+  mount /var/lib/containers
+  restorecon -R /var/lib/containers 2>/dev/null || true
+fi
+
+# Podman (docker.sock is needed by TFE for the run containers), jq, and the psql client for the database bootstrap
+dnf install -y podman podman-docker jq curl || { echo "ERROR: dnf install podman failed"; exit 1; }
+dnf install -y postgresql || echo "postgresql client not installed, init_postgres.sh will use the container fallback"
+systemctl enable --now podman.socket
+
+# The minimal image has no firewall. If one is running anyway, open the TFE ports.
+if systemctl is-active --quiet firewalld; then
+  firewall-cmd --permanent --add-port=443/tcp --add-port=8201/tcp && firewall-cmd --reload
+fi
+
+echo "=== install_software done"
